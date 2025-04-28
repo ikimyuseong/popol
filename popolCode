@@ -1,0 +1,595 @@
+
+
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using System.Runtime.InteropServices;
+using UnityEngine.UI;
+using TMPro;
+using System;
+using UnityEngine.SceneManagement;
+//using Unity.VisualScripting;
+//using System.Runtime.CompilerServices;
+//using System.Text;
+//using System.Linq;
+//using System.Drawing;
+//using System.IO;
+//using System.Net;
+//using System.Diagnostics.Tracing;
+//using System.Threading.Tasks;
+using System.Threading;
+//using UnityEngine.PlayerLoop;
+//using System.Security.Cryptography;
+
+
+[StructLayout(LayoutKind.Sequential)]
+public struct ObjTransform
+{
+    public bool dir;
+    public float posx;
+    public float posy;
+
+}
+[StructLayout(LayoutKind.Sequential)]
+public struct PacketHeader
+{
+    public int pack_len;
+    public int packet_type;
+}
+
+public class DataFromToServer : MonoBehaviour
+{
+
+    [DllImport("IOCP_Client")]
+    public static extern void CloseClient();
+    [DllImport("IOCP_Client")]
+    public static extern int Login();
+    [DllImport("IOCP_Client")]
+    public static extern int InRoom(int room_number);
+    [DllImport("IOCP_Client")]
+    public static extern int AddSetSendPse(IntPtr c, int idx,int csize);
+    [DllImport("IOCP_Client")]
+    public static extern void RoomsUpdate(IntPtr c);
+
+    [DllImport("IOCP_Client")]
+    public static extern void CopyRoomsReWrite(IntPtr info);
+    [DllImport("IOCP_Client")]
+    public static extern IntPtr GetUserInfo(string key);
+    [DllImport("IOCP_Client")]
+    public static extern IntPtr GetByte();
+    [DllImport("IOCP_Client")]
+    public static extern void DelByte(IntPtr p);
+
+    [DllImport("IOCP_Client")]
+    public static extern bool QueueAndExecuteWorkItem();
+    [DllImport("IOCP_Client")]
+    public static extern void Send_Uni(IntPtr value, int size);
+    [DllImport("IOCP_Client")]
+    public static extern void Send_StrData(IntPtr ph, string value,int begin ,int size);
+
+    [DllImport("IOCP_Client")]
+    public static extern void SetUserInfo(string key, IntPtr value, int size);
+    private static DataFromToServer instance;
+
+    public GameObject GetPlayerObj { get { return playerObj; } private set { } }
+    public static DataFromToServer Instance
+    {
+        get
+        {
+            if (instance == null)
+            {
+                instance = FindObjectOfType<DataFromToServer>();
+
+            }
+            return instance;
+        }
+    }
+    [SerializeField]
+    private GameObject loginbox;
+    [SerializeField]
+    private GameObject roomlist;
+    [SerializeField]
+    private GameObject canvasObj;
+    [SerializeField]
+    private GameObject roomListContent;
+    [SerializeField]
+    private GameObject renewalbtnObj;
+    [SerializeField]
+    private GameObject logintext;
+    [SerializeField]
+    private int myRoomnum;
+    [SerializeField]
+    private const int MAX_ROOM = 21;
+    [SerializeField]
+    private GameObject bullet;
+    [SerializeField]
+    private Bullet bulletSc;
+
+
+    public Thread mainThread = Thread.CurrentThread;
+    public Dictionary<int, PlaterController> intToPlayer = new Dictionary<int, PlaterController>();
+    public Dictionary<PlaterController, int> playerToInt = new Dictionary<PlaterController, int>();
+    public Dictionary<int, GameObject> bulletsD = new Dictionary<int, GameObject>();
+    public int mySocketnum = 0;
+
+    private GameObject playerObj;
+    float timer = 5.0f;
+
+    private void Awake()
+    {
+        DontDestroyOnLoad(this.gameObject);
+        Application.targetFrameRate = 30;
+
+        if (instance == null)
+        {
+            instance = this;
+        }
+        else
+        {
+            Destroy(this.gameObject);
+            return;
+        }
+        
+        canvasObj = GameObject.Find("Canvas").gameObject;
+        loginbox = canvasObj.transform.Find("LoginBox").gameObject;
+        roomlist = canvasObj.transform.Find("RoomList").gameObject;
+        roomListContent = roomlist.transform.GetChild(0).GetChild(0).GetChild(0).gameObject;
+        renewalbtnObj = canvasObj.transform.Find("Renewal").gameObject;
+
+        loginbox.SetActive(true);
+        roomlist.SetActive(false);
+        renewalbtnObj.SetActive(false);
+    }
+    void Start()
+    {
+        mainThread = System.Threading.Thread.CurrentThread;
+    }
+    private void Update()
+    {
+        try
+        {
+            IntPtr ptr = IntPtr.Zero;
+
+            ptr = GetByte();
+
+            if (ptr != IntPtr.Zero)
+            {
+                int phlen = Marshal.ReadInt32(ptr);
+                int phtype = Marshal.ReadInt32(IntPtr.Add(ptr, 4));
+
+                if (phtype == 1)
+                {
+                    IntPtr value = Marshal.AllocHGlobal(4);
+                    Marshal.WriteInt32(value, 0);
+                    Marshal.FreeHGlobal(value);
+
+                    loginbox.SetActive(false);
+                    roomlist.SetActive(true);
+                    renewalbtnObj.SetActive(true);
+
+                    IntPtr _space = Marshal.AllocHGlobal(4);
+                    Marshal.WriteInt32(_space, myRoomnum);
+                
+                    SetUserInfo("space", _space, 4);
+                    Marshal.FreeHGlobal(_space);
+                
+                    IntPtr _socketnum = Marshal.AllocHGlobal(4);
+                    Marshal.WriteInt32(_socketnum, Marshal.ReadInt32(IntPtr.Add(ptr, 8)));
+                    SetUserInfo("socketnum", _socketnum, 4);
+
+                    Marshal.FreeHGlobal(_socketnum);
+                    CopyRoomsReWrite(IntPtr.Add(ptr, 12));
+                    GenerateRoomList();
+                }
+                else if (phtype == 3)
+                {
+                    if (intToPlayer.Count > 0)
+                    {
+                        intToPlayer.Clear();
+                        playerToInt.Clear();
+                    }
+
+                    List<int> keys = new List<int>();
+                    List<ObjTransform> ots = new List<ObjTransform>();
+                    List<int> namelen = new List<int>();
+                    List<string> names = new List<string>();
+                    int idx = 8;
+
+                    while (idx < phlen)
+                    {
+                        keys.Add(Marshal.ReadInt32(IntPtr.Add(ptr, idx)));
+                        ots.Add(Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, idx + 4)));
+                        namelen.Add(Marshal.ReadInt32(IntPtr.Add(ptr, idx + 16)));
+                        names.Add(Marshal.PtrToStringAnsi(IntPtr.Add(ptr, idx + 20)));
+                        idx += (4 + 12 + 4 + namelen[namelen.Count - 1]);
+                    }
+
+                    SceneManager.LoadScene("GamePlay");
+
+                    StartCoroutine(WhileCheck(null, () =>
+                    {
+                        if (SceneManager.GetActiveScene().name == "GamePlay")
+                        {
+                            for (int k = 0; k < keys.Count; k++)
+                            {
+                                int otherNum = keys[k];
+                                PlaterController p;
+
+                                if (Marshal.ReadInt32(GetUserInfo("socketnum")) == otherNum)
+                                {
+                                    float yy = UnityEngine.Random.Range(-15, 15);
+                                    float xx = UnityEngine.Random.Range(-30, 30);
+
+                                    playerObj = GameObject.Instantiate(GameAssistent.Instance.playerPrefab, new Vector2(xx * 10, yy * 10), Quaternion.identity);
+                                    playerObj.GetComponentInChildren<AudioListener>().enabled = true;
+
+                                    p = playerObj.GetComponent<PlaterController>();
+                                    p.myObj = true;
+                                    p.textMeshPro.color = UnityEngine.Color.green;
+                                    p.textMeshPro.text = names[k];
+                                    IntPtr sendPtr = Marshal.AllocHGlobal(28 + namelen[k]);
+                         
+                                    Marshal.WriteInt32(IntPtr.Add(sendPtr, 0), 28 + namelen[k]);
+                                    Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 2);
+                                   
+                                    ObjTransform ot;
+                                    ot.dir = false;
+                                    ot.posy = playerObj.transform.position.y;
+                                    ot.posx = playerObj.transform.position.x;
+                                  
+                                    IntPtr value = Marshal.AllocHGlobal(4);
+                                    Marshal.WriteInt32(value, myRoomnum);
+                                    SetUserInfo("space", value, 4);
+                                    Marshal.FreeHGlobal(value);
+                                
+                                    Marshal.WriteInt32(IntPtr.Add(sendPtr, 8), Marshal.ReadInt32(GetUserInfo("space")));
+                                    Marshal.WriteInt32(IntPtr.Add(sendPtr, 12), Marshal.ReadInt32(GetUserInfo("socketnum")));
+                                  
+                                    Marshal.StructureToPtr<ObjTransform>(ot, IntPtr.Add(sendPtr, 16), false);
+                                    Send_StrData(sendPtr, names[k], 28, namelen[k]);
+                                    Marshal.FreeHGlobal(sendPtr);
+                                    //Send_Uni(sendPtr, 28);
+
+                                }
+                                else
+                                {
+                                    Vector3 pos = new Vector3(ots[k].posx, ots[k].posy, 0);
+                                    GameObject g = GameObject.Instantiate(GameAssistent.Instance.playerPrefab, pos, Quaternion.identity);
+                                    p = g.GetComponent<PlaterController>();
+                                    p.textMeshPro.color = UnityEngine.Color.red;
+                                    p.textMeshPro.text = names[k];
+                                    p.GetSpriteRenderer().flipX = ots[k].dir;
+                                    p.camera.SetActive(false);
+                                }
+                                intToPlayer.Add(otherNum, p);
+                                playerToInt.Add(p, otherNum);
+                            }
+
+
+                            return true;
+                        }
+                        else
+                            return false;
+                    }));
+                }
+                else if (phtype == 2)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    ObjTransform tmpobjt = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+                    GameObject g = GameObject.Instantiate(GameAssistent.Instance.playerPrefab, new Vector3(tmpobjt.posx, tmpobjt.posy, 0.0f), Quaternion.identity);
+                    
+                    PlaterController pl = g.GetComponent<PlaterController>();
+                    pl.textMeshPro.color = UnityEngine.Color.red;
+                    pl.textMeshPro.text = Marshal.PtrToStringAnsi(IntPtr.Add(ptr, 28));
+                    pl.GetSpriteRenderer().flipX = tmpobjt.dir;
+                    pl.camera.SetActive(false);
+                    intToPlayer.Add(otherNum, pl);
+                    playerToInt.Add(pl, otherNum);
+                }
+                else if (phtype == 4)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+
+                    ObjTransform tmpobjt = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+
+                    intToPlayer[otherNum].transform.position = new Vector3(tmpobjt.posx, tmpobjt.posy, 0.0f);
+                    intToPlayer[otherNum].GetSpriteRenderer().flipX = tmpobjt.dir;
+
+                }
+                else if (phtype == 12)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    ObjTransform tmpobjt = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+                    int bulletnum = Marshal.ReadInt32(IntPtr.Add(ptr, 28));
+                    GameObject b = intToPlayer[otherNum].CreateBullet(false);
+                    bulletsD.Add(bulletnum, b);
+                    intToPlayer[otherNum].transform.position = new Vector3(tmpobjt.posx, tmpobjt.posy, 0.0f);
+                    intToPlayer[otherNum].GetSpriteRenderer().flipX = tmpobjt.dir;
+                }
+                else if (phtype == 6)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    ObjTransform tmpobjt = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+                    intToPlayer[otherNum].GetSpriteRenderer().flipX = tmpobjt.dir;
+                    intToPlayer[otherNum].gameObject.transform.position = new Vector3(tmpobjt.posx, tmpobjt.posy, 0.0f);
+                }
+                else if (phtype == 8)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    ObjTransform tmpobjt = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+                    int bulletnum = Marshal.ReadInt32(IntPtr.Add(ptr, 28));
+                    GameObject b = intToPlayer[otherNum].CreateBullet(false);
+                    bulletsD.Add(bulletnum, b);
+                    intToPlayer[otherNum].transform.position = new Vector3(tmpobjt.posx, tmpobjt.posy, 0.0f);
+                    intToPlayer[otherNum].GetSpriteRenderer().flipX = tmpobjt.dir;
+                }
+                else if (phtype == 18)
+                {
+                    int targetNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    ObjTransform o = Marshal.PtrToStructure<ObjTransform>(IntPtr.Add(ptr, 16));
+                    intToPlayer[targetNum].GetSpriteRenderer().flipX = o.dir;
+                    intToPlayer[targetNum].gameObject.transform.position = new Vector3(o.posx, o.posy, 0);
+                    intToPlayer[targetNum].gameObject.SetActive(true);
+                    intToPlayer[targetNum].camera.transform.parent = intToPlayer[targetNum].gameObject.transform;
+                    intToPlayer[targetNum].camera.transform.localPosition = new Vector3(0, 0, -1);
+                }
+                else if (phtype == 10)
+                {
+                    int targetNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    int bulletnum = Marshal.ReadInt32(IntPtr.Add(ptr, 16));
+                    GameObject tmp = bulletsD[bulletnum].gameObject;
+                    bulletsD.Remove(bulletnum);
+                    Destroy(tmp);
+
+                    GameObject boom = GameObject.Instantiate(GameAssistent.Instance.boomObj, intToPlayer[targetNum].gameObject.transform.position, Quaternion.identity);
+                    Destroy(boom, 2.0f);
+
+                    if (intToPlayer[targetNum].gameObject == playerObj)
+                    {
+                        System.Random r = new System.Random();
+
+                        float yy = r.Next(-15, 16);
+                        float xx = r.Next(-30, 31);
+
+                        IntPtr sendPtr = Marshal.AllocHGlobal(16);
+                        ObjTransform o;
+                        o.dir = false;
+                        o.posx = xx * 10;
+                        o.posy = yy * 10;
+
+
+                        Marshal.WriteInt32(IntPtr.Add(sendPtr, 0), 16);
+                        Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 16);
+                        Marshal.WriteInt32(IntPtr.Add(sendPtr, 8), Marshal.ReadInt32(GetUserInfo("space")));
+                        Marshal.WriteInt32(IntPtr.Add(sendPtr, 12), targetNum);
+
+                        Send_Uni(sendPtr, 16);
+                        Marshal.FreeHGlobal(sendPtr);
+                        intToPlayer[targetNum].camera.transform.parent = null;
+                        intToPlayer[targetNum].gameObject.SetActive(false);
+
+                        timer = 5.0f;
+                        StartCoroutine(WaitCor(() =>
+                        {
+                            timer -= Time.deltaTime;
+                            if (timer <= 0)
+                            {
+                                sendPtr = Marshal.AllocHGlobal(28);
+                                Marshal.WriteInt32(IntPtr.Add(sendPtr, 0), 28);
+                                Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 18);
+                                Marshal.WriteInt32(IntPtr.Add(sendPtr, 8), Marshal.ReadInt32(GetUserInfo("space")));
+                                Marshal.WriteInt32(IntPtr.Add(sendPtr, 12), targetNum);
+                                Marshal.StructureToPtr<ObjTransform>(o, IntPtr.Add(sendPtr, 16), false);
+                                Send_Uni(sendPtr, 28);
+
+                                intToPlayer[targetNum].GetSpriteRenderer().flipX = o.dir;
+                                intToPlayer[targetNum].gameObject.transform.position = new Vector3(o.posx, o.posy, 0);
+                                intToPlayer[targetNum].gameObject.SetActive(true);
+                                intToPlayer[targetNum].camera.transform.parent = intToPlayer[targetNum].gameObject.transform;
+                                intToPlayer[targetNum].camera.transform.localPosition = new Vector3(0, 0, -1);
+                                timer = 5.0f;
+                                return true;
+                            }
+                            else
+                                return false;
+                        }));
+                    }
+                }
+                else if (phtype == 16)
+                {
+                    int targetNum = Marshal.ReadInt32(IntPtr.Add(ptr, 12));
+                    intToPlayer[targetNum].camera.transform.parent = null;
+                    intToPlayer[targetNum].gameObject.SetActive(false);
+                }
+                else if (phtype == 5)
+                {
+                    canvasObj = GameObject.Find("Canvas").gameObject;
+                    loginbox = canvasObj.transform.Find("LoginBox").gameObject;
+                    roomlist = canvasObj.transform.Find("RoomList").gameObject;
+                    renewalbtnObj = canvasObj.transform.Find("Renewal").gameObject;
+                    roomListContent = roomlist.transform.GetChild(0).GetChild(0).GetChild(0).gameObject;
+
+                    loginbox.SetActive(false);
+                    roomlist.SetActive(true);
+                    renewalbtnObj.SetActive(true);
+
+                    CopyRoomsReWrite(IntPtr.Add(ptr, 8));
+                    GenerateRoomList();
+                }
+                else if (phtype == 14)
+                {
+                    int otherNum = Marshal.ReadInt32(IntPtr.Add(ptr, 8));
+
+                    PlaterController p = intToPlayer[otherNum];
+                    intToPlayer.Remove(otherNum);
+                    playerToInt.Remove(p);
+                    Destroy(p.gameObject);
+
+                }
+                else if (phtype == 7)
+                {
+                    SceneManager.LoadScene("LobbyScene");
+                    loginbox.SetActive(false);
+                    roomlist.SetActive(true);
+                    renewalbtnObj.SetActive(true);
+                }
+
+                if (ptr != IntPtr.Zero)
+                     DelByte(ptr);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.Log("err : " + e.Message);
+        }
+    }
+
+    public void UpdateRoomlistBtn()
+    {
+       
+        IntPtr sendPtr = Marshal.AllocHGlobal(8);
+        Marshal.WriteInt32(IntPtr.Add(sendPtr, 0), 8);
+        Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 5);
+
+        Send_Uni(sendPtr, 8);
+        Marshal.FreeHGlobal(sendPtr);
+    }
+
+    void GenerateRoomList()
+    {
+        IntPtr tmp = Marshal.AllocHGlobal(MAX_ROOM * 4 + 1);
+        RoomsUpdate(tmp);
+
+        for (int i = 0; i < MAX_ROOM; i++)
+        {
+            int n = Marshal.ReadInt32(IntPtr.Add(tmp, 4 * i));
+            roomListContent.GetComponentsInChildren<Button>()[i].GetComponentInChildren<TMP_Text>().text = n.ToString() + "/ 4";
+        }
+    }
+
+    public async void LoginBtnClickEvent()
+    {   
+        StartCoroutine(WhileCheck(null,() => {
+            int n = Login();
+
+            if (n == 1)
+            {
+                QueueAndExecuteWorkItem();
+
+                string nickname = null;
+                nickname = logintext.GetComponent<TMP_InputField>().text;
+                IntPtr tmp = Marshal.AllocHGlobal(4096);
+
+                Marshal.WriteInt32(tmp, 8 + nickname.Length + 1);
+                Marshal.WriteInt32(IntPtr.Add(tmp, 4), 1);
+            
+                SetUserInfo("username", Marshal.StringToHGlobalAnsi(nickname), nickname.Length + 1);
+
+                Send_StrData(tmp, nickname, 8, nickname.Length + 1);
+                Marshal.FreeHGlobal(tmp);
+
+                return true;
+            }
+            else
+                return false;
+        }));
+      
+
+    }
+    public void InRoomBtn(GameObject obj)
+    {
+        int roomnumber = 0;
+        foreach (Button b in roomListContent.GetComponentsInChildren(typeof(Button)))
+        {
+            roomnumber++;
+            if (b.gameObject.name.Equals(obj.gameObject.name))
+            {
+                break;
+            }
+
+        }
+        int rst = -1;
+        rst = InRoom(roomnumber);
+        myRoomnum = roomnumber;
+    }
+
+    public void CloseRoomFunc()
+    {
+        try
+        {
+            IntPtr sendPtr = Marshal.AllocHGlobal(12); 
+            Marshal.WriteInt32(sendPtr, 12);
+            Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 14);
+
+            Debug.Log(Marshal.ReadInt32(GetUserInfo("socketnum")));
+            Marshal.WriteInt32(IntPtr.Add(sendPtr, 8), Marshal.ReadInt32(GetUserInfo("socketnum")));
+            Send_Uni(sendPtr, 12);
+            Marshal.FreeHGlobal(sendPtr);
+            playerObj = null;
+
+            SceneManager.LoadScene("LobbyScene");
+            StartCoroutine(WhileCheck(() =>
+            {
+                if (SceneManager.GetActiveScene().name == "LobbyScene")
+                {
+                    sendPtr = Marshal.AllocHGlobal(8);
+                    Marshal.WriteInt32(sendPtr, 8);
+                    Marshal.WriteInt32(IntPtr.Add(sendPtr, 4), 5);
+
+                    Send_Uni(sendPtr, 8);
+                    Marshal.FreeHGlobal(sendPtr);
+                    return true;
+                }
+                else
+                    return false;
+            }));
+        }
+        catch (Exception e)
+        {
+            Debug.Log(e.Message);
+        }
+    }
+ 
+    public IEnumerator WaitCor(Func<bool> action)
+    {
+        yield return new WaitUntil(action);
+    }
+    public IEnumerator WhileCheck(object obj,Func<bool> action)
+    {
+        while(true)
+        {
+            if (action())
+                break;
+            yield return null;
+        }
+    }
+    public IEnumerator WhileCheck(Func<bool> action)
+    {
+        while (true)
+        {
+            if (action())
+                break;
+            yield return null;
+        }
+    }
+    public IEnumerator WaitCor(Action after, Func<bool> prev)
+    {
+        yield return new WaitUntil(prev);
+        after();
+    }
+    void OnApplicationQuit()
+    {
+        try
+        {
+            if (intToPlayer.Count > 0)
+                intToPlayer.Clear();
+            CloseClient();
+        }
+        catch (Exception e)
+        {
+            Debug.Log(e.Message);
+        }
+
+    }
+
+}
