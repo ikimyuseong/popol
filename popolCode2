@@ -1,0 +1,614 @@
+typedef SOCKET_EX* PSOCKET_EX;
+
+typedef std::set<PSOCKET_EX>* SOCK_SET;
+
+struct OVERLAPPED_ENTRY_EX : OVERLAPPED_ENTRY
+{
+public :
+     PSOCKET_EX GetPsockex()
+	{
+		return reinterpret_cast<SOCKET_EX*>(this->lpOverlapped);
+	};
+};
+
+map<int, set<PSOCKET_EX>> spaceInfo;
+map<PSOCKET_EX, int> socketroomnum;
+
+HandlesInfo handles_info;
+PVOID GetSockExtAPI(SOCKET sock, GUID guidFn)
+{
+	PVOID pfnEx = NULL;
+	GUID guid = guidFn;
+	DWORD dwBytes = 0;
+	LONG lRet = ::WSAIoctl
+	(
+		sock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+		&guid, sizeof(guid), &pfnEx,
+		sizeof(pfnEx), &dwBytes, NULL, NULL
+	);
+	if (lRet == SOCKET_ERROR)
+	{
+		cout << "WSAIoctl failed, code : " << WSAGetLastError() << endl;
+		return NULL;
+	}
+	return pfnEx;
+}
+
+inline PSOCKET_EX GernerateClone(SOCKET x,vector<char>* vec,int vecLen)
+{
+	PSOCKET_EX poe = new SOCKET_EX(x);
+	poe->clone = true;
+	poe->dataMemo.vec.reserve(BUFSIZE);
+	memcpy(poe->dataMemo.vec.data(), (*vec).data(), vecLen);
+	poe->dataMemo.wb.buf = poe->dataMemo.vec.data();
+	poe->dataMemo.wb.len = vecLen;
+	poe->dataslen = vecLen;
+	return poe;
+}
+inline PSOCKET_EX GernerateRecvPs(SOCKET x, vector<char>* vec, int vecLen)
+{
+	PSOCKET_EX poe = new SOCKET_EX(x);
+	
+	memcpy(poe->dataMemo.vec.data(), (*vec).data(), vecLen);
+	poe->dataMemo.wb.buf = &poe->dataMemo.vec.data()[vecLen];
+	poe->dataMemo.wb.len = vecLen;
+	poe->dataslen = vecLen;
+	return poe;
+}
+inline DWORD CompletionCallback(PVOID pol)
+{
+	OVERLAPPED_ENTRY_EX overEntryEx = *((OVERLAPPED_ENTRY_EX*)pol);
+	PSOCKET_EX psktEx = reinterpret_cast<PSOCKET_EX>(overEntryEx.lpOverlapped);
+
+    DWORD datas = overEntryEx.dwNumberOfBytesTransferred;
+	DWORD dwFlags = 0;
+
+	if (datas <= 0 || datas >= BUFSIZE)
+	{
+		if (psktEx->dataslen == 0)
+			WSARecv(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, &dwFlags, psktEx, NULL);
+		else
+			WSASend(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, dwFlags, psktEx, NULL);
+		return 0;
+	}
+
+	if(psktEx->dataslen == 0)
+	{
+		DWORD begin_idx = 0;
+		vector<char> memoTothem = {};
+		memoTothem.reserve(BUFSIZE);
+		vector<char> memoToOne = {};
+		memoToOne.reserve(BUFSIZE);
+		//int myPlaceNum = socketroomnum[psktEx->Get_socket()];
+		int idxTothem = 0;
+		int idxToOne = 0;
+
+		DWORD sumOfLen = datas;
+		while (true)
+		{
+			if (sumOfLen == begin_idx)
+			{
+				psktEx->dataMemo.wb.buf = psktEx->dataMemo.vec.data();
+				psktEx->dataMemo.wb.len = BUFSIZE;
+				WSARecv(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, &dwFlags, psktEx, NULL);
+					//cout << "begin_idx == byteslen" << begin_idx << ", " << datas << endl;
+				break;
+			}
+
+			if (sumOfLen < begin_idx + sizeof(PacketHeader))
+			{
+				psktEx->dataMemo.wb.buf = &psktEx->dataMemo.vec.data()[sumOfLen];
+				psktEx->dataMemo.wb.len = BUFSIZE;
+				psktEx->dataslen = 0;
+				WSARecv(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, &dwFlags, psktEx, NULL);
+			//	cout << "byteslen < sizeof(PacketHeader)" << begin_idx << "begin " << datas << endl;
+				break;
+			}
+
+			PacketHeader ph = {};
+			memcpy(&ph, &psktEx->dataMemo.vec.data()[begin_idx], sizeof(PacketHeader));
+
+			 if (sumOfLen < begin_idx + ph.packet_len)
+			{
+				psktEx->dataMemo.wb.buf = &psktEx->dataMemo.vec.data()[sumOfLen];
+				psktEx->dataMemo.wb.len = BUFSIZE;
+				psktEx->dataslen = 0;
+				WSARecv(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, &dwFlags, psktEx, NULL);
+				
+				break;
+			}
+	
+			if (ph.packet_type == 1) //로그인
+			{
+				spaceInfo[LOBBY_NUMBER].insert(psktEx);
+				vector<char> newname;
+				newname.resize(ph.packet_len - sizeof(PacketHeader));
+				psktEx->name.swap(newname);
+				memcpy(psktEx->name.data(), &psktEx->dataMemo.vec.data()[begin_idx + sizeof(PacketHeader)], ph.packet_len - sizeof(PacketHeader));
+
+				map<int, set<PSOCKET_EX>>::iterator iter = spaceInfo.begin();
+				PacketHeader tmp_ph;
+				tmp_ph.packet_type = 1;
+				tmp_ph.packet_len = sizeof(PacketHeader) + sizeof(uint32_t);
+
+				for (int i = 0; iter != spaceInfo.end(); iter++)
+				{
+					if ((*iter).first == LOBBY_NUMBER)
+						continue;
+					uint32_t n = (*iter).second.size();
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + sizeof(uint32_t) + sizeof(uint32_t) * i], &n, sizeof(uint32_t));
+					i++;
+					tmp_ph.packet_len += sizeof(uint32_t);
+				}
+				
+				memcpy(&memoToOne.data()[idxToOne], &tmp_ph, sizeof(PacketHeader));
+				int n = static_cast<int>(psktEx->Get_socket());
+				memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader)], &n, sizeof(uint32_t));
+				idxToOne += tmp_ph.packet_len;
+			}
+			else if (ph.packet_type % 2 == 0)
+			{
+				if (ph.packet_type == 14)
+				{
+					int _socketroomnum = socketroomnum[psktEx];
+					spaceInfo[LOBBY_NUMBER].insert(psktEx);
+					spaceInfo[_socketroomnum].erase(psktEx);
+				}
+				
+				memcpy(&memoTothem.data()[idxTothem], &psktEx->dataMemo.vec.data()[begin_idx], ph.packet_len);
+				idxTothem += ph.packet_len;
+			}
+			else if (ph.packet_type == 5)
+			{
+				map<int, set<PSOCKET_EX>>::iterator iter = spaceInfo.begin();
+				PacketHeader tmp_ph;
+				tmp_ph.packet_type = 5;
+				tmp_ph.packet_len = sizeof(PacketHeader);
+				for (int i = 0; iter != spaceInfo.end(); iter++)
+				{
+					if ((*iter).first == LOBBY_NUMBER)
+						continue;
+					uint32_t n = (*iter).second.size();
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + sizeof(uint32_t) * i], &n, sizeof(uint32_t));
+					i++;
+					tmp_ph.packet_len += sizeof(uint32_t);
+				}
+
+				memcpy(&memoToOne.data()[idxToOne], &tmp_ph, sizeof(PacketHeader));
+				idxToOne += tmp_ph.packet_len;
+			}
+			else if (ph.packet_type == 7)
+			{
+				PacketHeader tmp_ph;
+				tmp_ph.packet_type = 7;
+				tmp_ph.packet_len = sizeof(PacketHeader);
+				memcpy(&memoToOne.data()[idxToOne], &tmp_ph, sizeof(PacketHeader));
+				idxToOne += tmp_ph.packet_len;
+			}
+			else if (ph.packet_type == 3)
+			{
+				uint32_t newRoomNum = LOBBY_NUMBER;
+				memcpy(&newRoomNum, &psktEx->dataMemo.vec.data()[begin_idx + sizeof(PacketHeader)], sizeof(uint32_t));
+				cout << " room " << newRoomNum << endl;
+				if (spaceInfo[newRoomNum].size() <= ROOM_MAX_SIZE)
+				{
+					spaceInfo[newRoomNum].insert(psktEx);
+					spaceInfo[LOBBY_NUMBER].erase(psktEx);
+					socketroomnum[psktEx] = newRoomNum;
+			
+				}
+				else
+				{
+					socketroomnum[psktEx] = 0;
+				}
+
+				PacketHeader tmp_ph = {};
+				int idx = 0;
+				for (auto a : spaceInfo[newRoomNum])
+				{
+					//int n = socketnums[a.first];
+
+					
+					int namelen = a->name.capacity();
+					int n = static_cast<int>(a->Get_socket());
+					
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + tmp_ph.packet_len], &n, sizeof(uint32_t));
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + tmp_ph.packet_len + sizeof(uint32_t)], &socketroomnum[psktEx], sizeof(uint32_t));
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + tmp_ph.packet_len + sizeof(uint32_t) + sizeof(uint32_t)], &namelen, sizeof(uint32_t));
+					memcpy(&memoToOne.data()[idxToOne + sizeof(PacketHeader) + tmp_ph.packet_len + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t)], a->name.data(), namelen);
+					cout << " socketnum " << n << endl;
+					
+					cout << "namelen " << namelen << endl;
+					cout <<  a->name.data()  << endl;
+					tmp_ph.packet_len += (sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t)  + namelen);
+				}
+				tmp_ph.packet_len += sizeof(PacketHeader);
+				tmp_ph.packet_type = 3;
+				
+				memcpy(&memoToOne.data()[idxToOne], &tmp_ph, sizeof(PacketHeader));
+				idxToOne += tmp_ph.packet_len;
+			}
+			begin_idx += ph.packet_len;
+		}
+	
+		if (idxTothem != 0)
+		{
+			PSOCKET_EX poe = nullptr;
+			int roomnumm = socketroomnum[psktEx];
+			for (PSOCKET_EX x : spaceInfo[roomnumm])
+			{
+				if (x->Get_socket() == psktEx->Get_socket())
+					continue;
+				poe = GernerateClone(x->Get_socket(), &memoTothem, idxTothem);
+				WSASend(poe->Get_socket(), &poe->dataMemo.wb, 1, 0, NULL, poe, NULL);
+			}
+		}
+
+		if (idxToOne != 0)
+		{
+			//PSOCKET_EX poe = GernerateSendPs(psktEx->Get_socket(), &memoToOne, idxToOne);
+			memcpy(psktEx->dataMemo.vec.data(), memoToOne.data(), idxToOne);
+			psktEx->dataMemo.wb.buf = psktEx->dataMemo.vec.data();
+			psktEx->dataMemo.wb.len = idxToOne;
+			psktEx->dataslen = idxToOne;
+			WSASend(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, dwFlags, psktEx, NULL);
+		}
+		return 0;
+	}
+	else
+	{
+		psktEx->dataslen -= datas;
+	}
+
+	if (psktEx->dataslen > 0)
+	{
+		int idx = psktEx->dataMemo.wb.len - psktEx->dataslen;
+		psktEx->dataMemo.wb.buf = &psktEx->dataMemo.vec.data()[idx];
+		psktEx->dataMemo.wb.len = psktEx->dataslen;
+		WSASend(psktEx->Get_socket(), &psktEx->dataMemo.wb, 1, 0, dwFlags, psktEx, NULL);
+	}
+	else
+	{
+		//delete psktEx;
+	}
+	return 0;
+}
+
+
+DWORD WINAPI FUNC(PVOID arg)
+{
+	
+	PIOCP_EX tmp_iocpEx = (PIOCP_EX)arg;
+	SOCKET s = NULL;
+
+	int count = 0;
+	while (true)
+	{
+		ULONG numEntriesRemoved = 0;
+		OVERLAPPED_ENTRY_EX* pove[2] = {};
+		OVERLAPPED_ENTRY_EX* p = {};
+		OVERLAPPED_ENTRY_EX ove[20];
+
+		try 
+		{
+			BOOL result = GetQueuedCompletionStatusEx(tmp_iocpEx->_iocp, ove, ARRAYSIZE(ove), &numEntriesRemoved, INFINITE, TRUE);
+			if (result == FALSE)
+			{
+				DWORD error = GetLastError(); 
+				if (error != WAIT_IO_COMPLETION)
+				{
+					p = ove;
+					throw error;
+				}
+				cout << numEntriesRemoved << endl;
+				continue;
+			}
+			
+			for (int i = 0; i < numEntriesRemoved; i++) 
+			{
+				p = &ove[i];
+				if (ove[i].lpCompletionKey == PAR_SOCKET)
+				{		
+					PSOCKET_EX tmp_pse = reinterpret_cast<PSOCKET_EX>(ove[i].lpOverlapped);
+					CreateIoCompletionPort((HANDLE)tmp_pse->Get_socket(), tmp_iocpEx->_iocp, CHI_SOCKET, 1);
+					
+					PostThreadMessage(tmp_iocpEx->main_threadId, MSG_USER_CONNECTED, 0, (LPARAM)tmp_pse);
+					DWORD dwFlags = 0;
+					  cout << "socket user : " << tmp_pse->Get_socket() << endl;
+						tmp_pse->dataMemo.vec.reserve(BUFSIZE);
+						tmp_pse->dataMemo.wb.buf = tmp_pse->dataMemo.vec.data();
+						tmp_pse->dataMemo.wb.len = BUFSIZE;
+
+					WSARecv(tmp_pse->Get_socket(), &tmp_pse->dataMemo.wb, 1, 0, &dwFlags, tmp_pse, NULL);
+					if (result == SOCKET_ERROR)
+					{
+						int errorcode = WSAGetLastError();
+						if (errorcode != WSA_IO_PENDING)
+							throw errorcode;
+					}
+				}
+				else
+				{
+					if (ove[i].dwNumberOfBytesTransferred == 0)
+					{
+						if (ove[i].lpOverlapped == NULL)
+						{
+							throw WSAGetLastError();
+						}
+						else
+						{
+							throw (int)ove[i].lpOverlapped->Internal;
+						}
+					}
+					BOOL d = CompletionCallback((PVOID)&ove[i]);
+				}
+			}
+			
+		}
+		catch (int ex)
+		{
+			if (ex == STATUS_LOCAL_DISCONNECT || ex == STATUS_CANCELLED)
+			{
+				cout << " ==> Child socket closed." << endl;
+				closesocket(p->GetPsockex()->Get_socket());
+				continue;
+			}
+			else if (ex == STATUS_CONNECTION_RESET)
+			{
+				cout << "close socket" << endl;
+			}
+			else
+				cout << " ex :" << GetLastError() << endl;
+			
+
+			if (ex == ERROR_INVALID_PARAMETER)
+				cout << "Cancel!!!" << endl;
+			PostThreadMessage(tmp_iocpEx->main_threadId, MSG_USER_DISCONNECTED, ex, (LPARAM)p->GetPsockex());
+		}
+	}
+	return 0;
+}
+void AddSockets(PSOCKET_EX sock_ex, SOCK_SET pool)
+{
+	LPFN_ACCEPTEX pfn_acceptEx = (LPFN_ACCEPTEX)GetSockExtAPI(sock_ex->Get_socket(), WSAID_ACCEPTEX);
+	
+	for (int i = 0; i < MIN_SOCKET_COUNT; i++)
+	{
+		SOCKET client_sock = socket(AF_INET, SOCK_STREAM, 0);
+		if (client_sock == INVALID_SOCKET)
+			break;
+
+		int bufSize = BUFSIZE;
+		setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (char*)&bufSize, sizeof(bufSize));
+		PSOCKET_EX pse = new SOCKET_EX(client_sock);
+		
+		pse->dataslen = 0;
+		pse->dataMemo.vec.reserve(BUFSIZE);
+
+		BOOL result = pfn_acceptEx(sock_ex->Get_socket(), client_sock, pse->dataMemo.vec.data(), 0,
+			sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16, NULL, (LPOVERLAPPED)pse);
+		if (result == FALSE)
+		{
+			if (WSAGetLastError() != WSA_IO_PENDING)
+			{
+				cout << WSAGetLastError() << endl;
+				closesocket(pse->Get_socket());
+				delete pse;
+				break;
+			}
+		}
+
+		pool->insert(pse);
+	}
+}
+void RemovePlayerList(PSOCKET_EX tmp_pse)
+{
+	int num = socketroomnum[tmp_pse];
+	spaceInfo[num].erase(tmp_pse);
+	socketroomnum.erase(tmp_pse);
+}
+int main()
+{
+	WSADATA wsa;
+	int n = WSAStartup(MAKEWORD(2, 2), &wsa);
+	
+	SOCKET hlsock = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (hlsock == INVALID_SOCKET)
+		return 0;
+	for (int i = LOBBY_NUMBER; i <= MAX_ROOMS; i++)
+	{
+		spaceInfo.insert({ i, set< PSOCKET_EX>() });
+	}
+	
+	sockaddr_in ai;
+	memset(&ai, 0, sizeof(SOCKADDR_IN));
+	ai.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
+	ai.sin_family = AF_INET;
+	ai.sin_port = htons(9000);
+	int lSockRet = bind(hlsock, (sockaddr*)&ai, sizeof(SOCKADDR_IN));
+
+	if ((DWORD)lSockRet == SOCKET_ERROR)
+	{
+		cout << "bind failed, code : " << WSAGetLastError() << endl;
+		closesocket(hlsock);
+		return INVALID_SOCKET;
+	}
+
+	listen(hlsock, SOMAXCONN);
+	PSOCKET_EX psock_ex = new SOCKET_EX(hlsock);
+	
+
+	memset(&handles_info, 0, sizeof(handles_info));
+	handles_info.main_threadId = GetCurrentThreadId();
+
+	handles_info._iocp = CreateIoCompletionPort((HANDLE)hlsock, NULL, PAR_SOCKET, 1);
+	if (handles_info._iocp == NULL)
+	{
+		cout << "failed " << endl;
+	}
+
+	SOCK_SET pool = new set<PSOCKET_EX>;
+	SOCK_SET actor = new set<PSOCKET_EX>;
+	AddSockets(psock_ex, pool);
+
+	SYSTEM_INFO sysInfo;
+	GetSystemInfo(&sysInfo);
+	
+	//PHANDLE thrd = new HANDLE[sysInfo.dwNumberOfProcessors * 2];
+	
+
+	for (int i = 0; i < sysInfo.dwNumberOfProcessors * 2; i++)
+	{
+		CreateThread(NULL, 0, &FUNC, (LPVOID)&handles_info, 0, NULL);
+	}
+	
+
+	WSAEVENT hEvent = WSACreateEvent();
+	WSAEventSelect(hlsock, hEvent, FD_ACCEPT);
+
+	while (true)
+	{
+		try
+		{
+			int result = MsgWaitForMultipleObjectsEx(1, &hEvent, 5000, QS_POSTMESSAGE, MWMO_INPUTAVAILABLE);
+			if (result == WAIT_FAILED)
+			{
+				WSAGetLastError();
+				break;
+			}
+			if (result == WAIT_TIMEOUT)
+			{
+				if (pool->size() > MIN_SOCKET_COUNT)
+				{
+					set<PSOCKET_EX>::iterator iter = pool->begin();
+					PSOCKET_EX se = (PSOCKET_EX)(*iter);
+					pool->erase(se);
+					closesocket(se->Get_socket());
+					
+					delete se;
+				}
+
+				cout << pool->size() << " , " << actor->size() << endl;
+				continue;
+			}
+			if (result == 1)
+			{
+				MSG msg;
+
+				BOOL pm_result = PeekMessage(&msg, NULL, 0, 0, PM_REMOVE);
+				if (!pm_result)
+					continue;
+
+				PSOCKET_EX tmp_pse = (PSOCKET_EX)(msg.lParam);
+
+				if (msg.message == MSG_USER_CONNECTED)
+				{
+					pool->erase(tmp_pse);
+					actor->insert(tmp_pse);
+				}
+				else if (msg.message == MSG_USER_DISCONNECTED)
+				{
+					cout << "MSG_USER_DISCONNECTED" << endl;
+				
+					actor->erase(tmp_pse);
+					RemovePlayerList(tmp_pse);
+					
+					if (pool->size() > MIN_SOCKET_COUNT)
+					{
+						cout << "Mincount closesocket" << endl;
+						
+						closesocket(tmp_pse->Get_socket());
+						delete tmp_pse;
+					}
+					else
+					{
+						
+						LPFN_DISCONNECTEX pfn_disconnectEx = (LPFN_DISCONNECTEX)GetSockExtAPI(tmp_pse->Get_socket(), WSAID_DISCONNECTEX);
+						if (!pfn_disconnectEx(tmp_pse->Get_socket(), NULL, TF_REUSE_SOCKET, 0))
+						{
+							cout << "refuse : failed " << endl;
+							int err = WSAGetLastError();
+							if (err == WSAENOTCONN) {
+								cout << "DisconnectEx failed: socket is not connected." << endl;
+								if (tmp_pse->Get_socket() == INVALID_SOCKET) {
+									std::cout << "Socket is invalid." << std::endl;
+								}
+								else
+								{
+									continue;
+								}
+							}
+							else {
+								cout << "DisconnectEx failed with error: " << err << endl;
+							}
+						}
+						if (CancelIoEx((HANDLE)tmp_pse->Get_socket(), tmp_pse))
+						{
+							cout << "CancelIoEx successs: " << endl;
+						}
+
+						LPFN_ACCEPTEX pfn_acceptEx = (LPFN_ACCEPTEX)GetSockExtAPI(psock_ex->Get_socket(), WSAID_ACCEPTEX);
+						BOOL bIsOK = pfn_acceptEx
+						(
+							hlsock, tmp_pse->Get_socket(), tmp_pse->dataMemo.vec.data(), 0,
+							sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16,
+							NULL, (LPOVERLAPPED)tmp_pse
+						);
+
+						if (bIsOK == FALSE)
+						{
+							if (WSAGetLastError() != WSA_IO_PENDING)
+							{
+								cout << "WSA_IO_PENDING closesocket" << endl;
+								closesocket(tmp_pse->Get_socket());
+								delete tmp_pse;
+								continue;
+							}
+
+						}
+						
+						cout << "socket ReFuse Internal : " << tmp_pse->Internal << endl;
+					
+						pool->insert(tmp_pse);
+					}
+				}
+				//cout << "wait pool size : " << pool->size() << "  actor pool size : " << actor->size() << endl;
+			}
+			else
+			{
+				//cout << "Addsocket" << endl;
+				WSANETWORKEVENTS ne;
+				WSAEnumNetworkEvents(psock_ex->Get_socket(), hEvent, &ne);
+				if (ne.lNetworkEvents & FD_ACCEPT)
+				{
+					if (pool->size() < MAX_SOCKET_COUNT)
+						AddSockets(psock_ex, pool);
+				}
+			}
+		}
+		catch (exception e)
+		{
+			cout << "socket ReFuse Internal : " << e.what() << endl;
+		}
+	}
+	CloseHandle(handles_info._iocp);
+	//WaitForMultipleObjects(4, pHThread, TRUE, INFINITE);
+	closesocket(psock_ex->Get_socket());
+	CloseHandle(hEvent);
+	for (set<PSOCKET_EX>::iterator it = actor->begin(); it != actor->end(); it++)
+	{
+		PSOCKET_EX pse = *it;
+		closesocket(pse->Get_socket());
+		delete pse;
+	}
+	for (set<PSOCKET_EX>::iterator it = pool->begin(); it != pool->end(); it++)
+	{
+		PSOCKET_EX pse = *it;
+		closesocket(pse->Get_socket());
+		delete pse;
+	}
+	WSACleanup();
+
+	return 0;
+}
